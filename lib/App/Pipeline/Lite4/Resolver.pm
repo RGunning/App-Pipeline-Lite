@@ -217,7 +217,8 @@ sub _resolve {
 
          # add in the output files expected for each step to the placeholder hash
          
-         $self->_add_steps_in_step_struct_to_placeholder_hash($row);
+         #$self->_add_steps_in_step_struct_to_placeholder_hash($row);
+         $self->_add_steps_in_step_struct_to_placeholder_hash2($row);
          $self->_create_directory_structure_from_placeholder_hash;
 
          # add software to placeholder hash - MUST GO AFTER CREATE DIRECTORY
@@ -459,9 +460,48 @@ The way it seems like this might work is:
     
 =cut
 
-sub _add_steps_in_step_struct_to_placeholder_hash {
+=method 
+    clean up of _add_steps_in_step_struct_to_placeholder_hash
+    we will handle three types of steps here:
+      * Normal Steps
+      * Groupby Steps
+      * Once Steps
+      
+    Under each of these steps we need to handle the placeholders differently
+      *Normal Steps:
+         - steps that originated from previous step types:
+             Normal Step Placeholder  - fine
+             Once Step Placeholder    - fine
+             Groupby Step Placeholder - not fine - in future it might be possible to refer to a groupby class
+         - jobs. placeholder        - fine
+         - groupby placeholder      - fine?  - should not be fine
+      *Groupby Steps
+         - steps that originated from previous step types:
+             Normal Step Placeholder  - not fine 
+             Once Step Placeholder    - fine
+             Groupby Step Placeholder - fine under certain circumstances
+         - jobs. placeholder        - fine
+         - groupby placeholder      - fine with condition 
+        
+=cut
+=method
+ Remember this is essentially just adding to a **placeholder_hash** 
+ which looks like:
+   'step1' => {
+          'filename' => '/path/to/filename'
+          'err'      => '/path/to/err'
+   }
+   'step2' => {
+   }
+   ...
+
+  This placeholder_hash is being built for each row in the datasource(see _resolve), then added to the  pipeline_step_struct_resolved
+  hash. Then it is cleaned out, and the next row is processed. So this function here is being called once per datasource 
+  row and then adding each time to placeholder_hash.
+=cut 
+sub _add_steps_in_step_struct_to_placeholder_hash2 {
     #TYPES: ( Num :$job_num ){
-    my $self = shift;
+    my $self    = shift;
     my $JOB_NUM = shift;
     my $step_struct = $self->pipeline_step_struct; # we have placeholders parsed for each step
 
@@ -470,145 +510,378 @@ sub _add_steps_in_step_struct_to_placeholder_hash {
         $self->logger->log( "debug", "Processing Pipeline to placeholder hash step " . $step_name);
         my $placeholders = $step_struct->{$step_name}->{placeholders};
         next unless defined($placeholders);
-        foreach my $placeholder ( @$placeholders ) {
-            # A placeholder that references step A, should be mentioned in step A.
-            # So we do not need to worry about it if it appears in other steps.
-            # Thus we only process the placeholders in step X that mention step X.
-            my $placeholder_resolved_str;
-            my @output_run_dir;
-            
-           #==== case 1. stepX.fileY ====
-           $self->logger->debug("step $step_name. Processing $placeholder");
-           my $placeholder_rgx = qr/^($step_name)(\.(.+))*$/;
-           if( @output_run_dir = $placeholder =~ $placeholder_rgx ){
-               $self->logger->debug("step $step_name. Got " . Dumper(@output_run_dir) . " from $placeholder");
-               # we don't want [1] - the dot, so @output_run_dir is 2 length array
-               @output_run_dir = @output_run_dir[0,2];
-               if( defined $output_run_dir[1] ){ 
-                   # if the 2nd element is defined e.g. normally a filename like note.txt                 
-                   $placeholder_resolved_str = $self->_generate_file_output_location($JOB_NUM, \@output_run_dir)->stringify;                  
-               }elsif (  defined $output_run_dir[0]  ) {
-                   #case where only the step name exists
-                   pop @output_run_dir; # remove last entry because if second element is not defined array = ("stepname",undef) 
-                   $placeholder_resolved_str = $self->_generate_file_output_location($JOB_NUM, \@output_run_dir)->stringify;
-                   #warn "PLACEHOLDER", $placeholder;
-                   #warn "OUTPUT RUN DIR (NORMAL PLCHOLDER) ". Dumper @output_run_dir;
-                   #warn "OUTPUTFILES(NORMAL PLCHOLDER) ".$output_files;
-               }
-               $self->logger->debug("step $step_name. Extracted a run dir from: @output_run_dir. Full path is $placeholder_resolved_str ");
-           }
-            
-
-           #==== case 2. jobs.[stepX|datasource].[fileY|datasource_column] ====
-           # To resolve this form of placeholder we need to generate a list of resolved placeholder paths over ALL jobs 
-           my $jobs_placeholder_rgx = qr/jobs\.([\w\-]+)\.(.+)$/;
-           if(@output_run_dir = $placeholder =~ $jobs_placeholder_rgx){
-              
-               my @placeholder_resolved_paths; # all the placeholder resolved paths
-               my $num_of_jobs = $self->tot_jobs;
-               for my $job_num ( 0 .. $num_of_jobs -1 ) {
-                    if( $output_run_dir[0] eq 'datasource' ) {
-                      my $t = $self->pipeline_datasource;
-                      my @datasource_rows = $t->col( $output_run_dir[1] );
-                      push(  @placeholder_resolved_paths,$datasource_rows[$job_num] );
-                    }else{
-                      push(  @placeholder_resolved_paths,
-                            $self->_generate_file_output_location(
-                                $job_num, \@output_run_dir)->stringify );
-                    }
-               }
-               # JOB FILTER: If we are running with specific job numbers, then we want only those paths associated
-               #             with those job numbers.
-               my $job_filter = $self->job_filter;
-               @placeholder_resolved_paths =  @placeholder_resolved_paths[@$job_filter] if defined ( $job_filter );
-               $placeholder_resolved_str = join ' ',  @placeholder_resolved_paths;
-               $self->logger->debug("step $step_name. Extracted a run dir from: @output_run_dir. Full path is $placeholder_resolved_str");
-           }
-
-
-            #==== case 3. groupby.groupby-field.[stepX|datasource].fileY
-            #  * you must groupby wrt a datasource column name. 
-            #      - So access the datasource and check whether the field name is relevant
-            #      - Figure out which resolved paths belong to each group
-            #  * For two groups (g=2) - the rule is that these are executed in the first g jobs. (job0,job1)
-            # 
-            #  * Thus far we do not yet handle groupby when there are job filters   
-            
-            if( $placeholder =~ /groupby/ ){  
-               my $groupby_placeholder_rgx;
-               # get the datasource
-               my $col_names = $self->pipeline_datasource->{header};
-               #warn "WORKING WITH DATASOURCE: " . $self->datasource_file; #warn "DATASOURCE: " . Dumper $self->pipeline_datasource;
-               my $col_names_rgx_str = join "|", @$col_names;
-               my $groupby_placeholder_rgx_str = 'groupby\.('.$col_names_rgx_str . ')\.(' . $col_names_rgx_str . ')*\.*([\w\-]+)\.(.+)$';
-               #warn "PLACEHOLDER $placeholder"; #warn "PLACEHOLDER RGX:", $groupby_placeholder_rgx_str;
-               $groupby_placeholder_rgx = qr/$groupby_placeholder_rgx_str/;
-               my @output_run_dir = $placeholder =~  $groupby_placeholder_rgx;
-               #warn "PLACEHOLDER PARTS:", Dumper @output_run_dir;
-
-               # Allows two groupby fields, here we check if the second groupby field is present
-               my @group_names;
-               if ( defined $output_run_dir[1] ){
-                   @group_names = @output_run_dir[0,1];
-                   @output_run_dir = @output_run_dir[2 .. $#output_run_dir];
-               }else{
-                   @group_names = $output_run_dir[0 ];
-                   @output_run_dir = @output_run_dir[2 .. $#output_run_dir];
-               }
-                # warn "OUTPUTDIR @output_run_dir";
-               if ( ! defined $output_run_dir[0] ){
-                   ouch 'App_Pipeline_Lite4_ERROR', "The groupby placeholder has a group name that does not exist in the datasource";
-               }
-
-               #warn "OUTPUTDIR", "@output_run_dir";#warn "GROUP NAMES: @group_names";
-               my $util = App::Pipeline::Lite4::Util->new;            
-               my $job_map_hash = $util->datasource_groupby2( $self->pipeline_datasource, @group_names );
-               # This gives a hash e.g.: {groupA=> [0,1,2,3], groupB=>[4,5,6]}
-               #warn Dumper $job_map_hash;
-                            
-               my $job_filter = $self->job_filter;
-               my %job_filter_hash = map{ $_ => 1 } @$job_filter if defined($job_filter);
-               
-               # order the groupnames - so that we always have the same groups in the same jobs
-               my @grouped_jobs = sort keys %$job_map_hash;
-               my $grouped_job_idx;               
-               $grouped_job_idx = ($JOB_NUM <= $#grouped_jobs) ? $JOB_NUM : 0;
-               
-               # if there is a job filter then we have to get the right group index 
-               if( defined $job_filter){
-                   $grouped_job_idx = $self->get_grouping_indexes($job_filter,$job_map_hash,$JOB_NUM); 
-               }
-               
-               # resolve for this placeholder the set of paths corresponding to the particular group associated with this JOB_NUM                             
-               my $grouped_jobs_id = $grouped_jobs[ $grouped_job_idx ];
-               my @placeholder_resolved_paths;
-               my $jobs = $job_map_hash->{$grouped_jobs_id};
-               
-               for my $job_num ( @$jobs){
-                   if( defined($job_filter) ){ 
-                       #skip adding into @placeholder_resolved_paths if job is in job filter
-                       next unless exists($job_filter_hash{$job_num} );
-                   }
-                   if( $output_run_dir[0] eq 'datasource' ) {
-                      my $t = $self->pipeline_datasource;
-                      my @datasource_rows = $t->col( $output_run_dir[1] );
-                      push( @placeholder_resolved_paths,$datasource_rows[$job_num] );
-                  }else{
-                      push( @placeholder_resolved_paths, $self->_generate_file_output_location($job_num, \@output_run_dir)->stringify );
-                  }  
-               }
-               $placeholder_resolved_str = join ' ', @placeholder_resolved_paths;
-               #warn "STEPFILES: $output_files";
-            }
-            # add to placeholder hash - if there is something to add
-            if( defined( $placeholder_resolved_str ) ){
-                $self->_placeholder_hash_add_item( $placeholder, $placeholder_resolved_str); #in order key,value
-                $self->logger->debug("step $step_name. Generated file location for placeholder $placeholder as $placeholder_resolved_str");
-            }
-         }
-   }
-   #warn Dumper $self->placeholder_hash;
+        
+        # NORMAL STEPS (NO CONDITIONS)
+        if( !defined( $step_struct->{$step_name}->{condition} ) ){
+            $self->_add_NORMALSTEP_in_step_struct_to_placeholder_hash($step_name, $JOB_NUM);
+        }elsif( $step_struct->{$step_name}->{condition} eq 'once' ){ 
+        # ONCE STEPS 
+            $self->_add_ONCESTEP_in_step_struct_to_placeholder_hash($step_name, $JOB_NUM);
+        }elsif ( $step_struct->{$step_name}->{condition} eq 'groupby'){ 
+        # GROUPBY STEPS    
+            $self->_add_GROUPBYSTEP_in_step_struct_to_placeholder_hash($step_name,$JOB_NUM);
+        }else{
+            $self->logger->log( "debug", 
+             "$step_name did not match any of normal, once, or groupby. This means it's placeholders are not added into the system");
+        }
+        
+    }
 }
+
+sub _add_ONCESTEP_in_step_struct_to_placeholder_hash {
+    my $self = shift;
+    my $step_name = shift;
+    my $JOB_NUM = shift;
+    my $step_struct = $self->pipeline_step_struct;
+    my $placeholders = $step_struct->{$step_name}->{placeholders};
+    #next unless defined($placeholders);
+    
+    foreach my $placeholder ( @$placeholders ) {
+        my $placeholder_resolved_str;
+        # normal steps of type stepx.file1 or whatever
+        # these can still come from several types of other steps 
+        my $placeholder_step_form = $self->_placeholder_step_form($placeholder, $step_name);
+        my ($placeholder_step_name) = $self->_parse_steppath_placeholder($placeholder);
+        if ( $placeholder_step_form eq 'step.path' ){ 
+            my $placeholder_step_condition = $step_struct->{$placeholder_step_name}->{condition};          
+            if( !defined ( $placeholder_step_condition )){ 
+                ouch 'App_Pipeline_Lite4_ERROR', 
+                  "Placeholder $placeholder in step $step_name references a normal step (not .once or .groupby) and is inconsistent with 
+                    a .once step.";                
+            }elsif ( $placeholder_step_condition eq 'once' ) {
+                my $min_job = 0;
+                my $jobs = $self->job_filter;
+                ($min_job) = sort {$a <=> $b} @$jobs if defined($jobs);
+                $placeholder_resolved_str=$self->_resolve_steppath_step_placeholder($placeholder,$placeholder_step_name, $min_job);
+            }elsif ( $placeholder_step_condition eq 'groupby' ){
+                ouch 'App_Pipeline_Lite4_ERROR', 
+                  "Placeholder $placeholder in step $step_name references a groupby step and is inconsistent with 
+                    a .once step.";  
+            }else{
+                ouch 'App_Pipeline_Lite4_ERROR',"The form of $step_name referenced by the placeholder $placeholder is not recognised by the system";
+            }         
+        }elsif ( $placeholder_step_form eq 'jobs' ){ 
+            # the step_name is purely for logging purposes
+            $placeholder_resolved_str=$self->_resolve_jobs_step_placeholder($placeholder, $step_name,   $JOB_NUM);
+        }elsif ( $placeholder_step_form eq 'groupby' ){ 
+            # ouch
+            ouch 'App_Pipeline_Lite4_ERROR',"A groupby placeholder exists in the .once step $step_name .";
+        }else{
+            ouch 'App_Pipeline_Lite4_ERROR',"The form of the placeholder $placeholder in $step_name is not recognised by the system";
+        }
+        
+        if( defined( $placeholder_resolved_str ) ){
+             $self->_placeholder_hash_add_item( $placeholder, $placeholder_resolved_str); #in order key,value
+             $self->logger->debug("step $step_name. Generated file location for placeholder $placeholder as $placeholder_resolved_str");
+        }
+    }
+}
+sub _add_GROUPBYSTEP_in_step_struct_to_placeholder_hash {
+    my $self = shift;
+    my $step_name = shift;
+    my $JOB_NUM = shift;
+    my $step_struct = $self->pipeline_step_struct;
+    my $placeholders = $step_struct->{$step_name}->{placeholders};
+    #next unless defined($placeholders);
+    
+    foreach my $placeholder ( @$placeholders ) {
+        my $placeholder_resolved_str;
+        # normal steps of type stepx.file1 or whatever
+        # these can still come from several types of other steps 
+        my $placeholder_step_form = $self->_placeholder_step_form($placeholder);
+        my ($placeholder_step_name) = $self->_parse_steppath_placeholder($placeholder);
+        if ( $placeholder_step_form eq 'step.path' ){ 
+            my $placeholder_step_condition = $step_struct->{$placeholder_step_name}->{condition};          
+            if( !defined ( $placeholder_step_condition )){    
+                 ouch 'App_Pipeline_Lite4_ERROR', 
+                  "Placeholder $placeholder in step $step_name references a normal step ($placeholder_step_name is not a .once or .groupby step) and is inconsistent with 
+                    a .groupby step.";                       
+            }elsif ( $placeholder_step_condition eq 'once' ) {
+                my $min_job = 0;
+                my $jobs = $self->job_filter;
+                ($min_job) = sort {$a <=> $b} @$jobs if defined($jobs);
+                $placeholder_resolved_str=$self->_resolve_steppath_step_placeholder($placeholder,$placeholder_step_name, $min_job);
+            }elsif ( $placeholder_step_condition eq 'groupby' ){ 
+                # any step.path placeholders in this step will come under this condition as well (since it's a groupby)
+                # for other steps, so long as it's a step that has the same groupby field as this step
+                my $this_step_groupby_field = $step_struct->{$step_name}->{condition_params}->[0];
+                my $placeholder_step_groupby_field = $step_struct->{$placeholder_step_name}->{condition_params}->[0];
+                ouch 'App_Pipeline_Lite4_ERROR', "step $step_name has placeholders that refer to different groupby criteria" if $this_step_groupby_field ne $placeholder_step_groupby_field;
+                $placeholder_resolved_str = $self->_resolve_steppath_step_placeholder($placeholder,$placeholder_step_name, $JOB_NUM); 
+            }          
+        }elsif ( $placeholder_step_form eq 'jobs' ){ 
+            # the step_name in this method is purely for logging purposes
+            $placeholder_resolved_str=$self->_resolve_jobs_step_placeholder($placeholder, $step_name, $JOB_NUM);
+        }elsif ( $placeholder_step_form eq 'groupby' ){ 
+            $placeholder_resolved_str=$self->_resolve_groupby_step_placeholder($placeholder, $step_name, $JOB_NUM);
+        }
+        if( defined( $placeholder_resolved_str ) ){
+             $self->_placeholder_hash_add_item( $placeholder, $placeholder_resolved_str); #in order key,value
+             $self->logger->debug("step $step_name. Generated file location for placeholder $placeholder as $placeholder_resolved_str");
+        }
+    }
+}
+
+
+=method
+  In a normal step - one without a condition like once of groupby 
+  we need to look at each placeholder and consider the kind of step its
+  has come from.
+    The [% step.path %] form placeholder could refer to a step that is: 
+      a) normal
+         i)   with the same step we are currently processing
+         ii)  references a different step         
+      b) groupby 
+      c) once
+      
+      
+    We then have to look at  other placeholer forms such as:
+    [% jobs...    %]
+    [% groupby....%]
+    
+    We only need to process a-i) above in the a) category because the other steps will already resolve and add
+    the placeholder to the placeholder_hash
+    
+    In the c category we have to ensure that we refer to only minimum/job0 job 
+    
+=cut
+sub _add_NORMALSTEP_in_step_struct_to_placeholder_hash {
+    my $self = shift;
+    my $step_name = shift;
+    my $JOB_NUM = shift;
+    my $step_struct = $self->pipeline_step_struct;
+    my $placeholders = $step_struct->{$step_name}->{placeholders};
+    #next unless defined($placeholders);
+    
+    foreach my $placeholder ( @$placeholders ) {
+        my $placeholder_resolved_str;
+        # normal steps of type stepx.file1 or whatever
+        # these can still come from several types of other steps 
+        my $placeholder_step_form = $self->_placeholder_step_form($placeholder);
+        my ($placeholder_step_name) = $self->_parse_steppath_placeholder($placeholder);
+        if ( $placeholder_step_form eq 'step.path' ){ 
+            my $placeholder_step_condition;
+            if( exists $step_struct->{$placeholder_step_name} ){
+                # we need to test whether it exists, otherwise, due to autovivication, suddenly we will
+                # have create a step in our $step_struct e.g. datasource or input, which are both 
+                # of the form step.path - but shouldn't be added to the step_struct (nothing should be added to this)
+                $placeholder_step_condition = $step_struct->{$placeholder_step_name}->{condition};          
+            }
+            if( !defined ( $placeholder_step_condition )){
+                if( $placeholder_step_name eq $step_name){
+                    # we only need to worry about the step.path that have the step name the same as this current step 
+                    # the other placeholders will be added either on other steps, or in the case of a datasource added
+                    # by it's own method
+                    $placeholder_resolved_str = $self->_resolve_steppath_step_placeholder($placeholder,$placeholder_step_name, $JOB_NUM);
+                }
+            }elsif ( $placeholder_step_condition eq 'once' ) {
+                my $min_job = 0;
+                my $jobs = $self->job_filter;
+                ($min_job) = sort {$a <=> $b} @$jobs if defined($jobs);
+                $placeholder_resolved_str=$self->_resolve_steppath_step_placeholder($placeholder,$placeholder_step_name, $min_job);
+            }elsif ( $placeholder_step_condition eq 'groupby' ){
+                ouch 'App_Pipeline_Lite4_ERROR',"A placeholder $placeholder in $step_name references .groupby step when $step_name is not a .groupby step.";
+            }
+           
+        }elsif ( $placeholder_step_form eq 'jobs' ){ 
+            # the $step_name in this function is purely for logging purposes in the method
+            $placeholder_resolved_str=$self->_resolve_jobs_step_placeholder($placeholder, $step_name,$JOB_NUM);
+        }elsif ( $placeholder_step_form eq 'groupby' ){ 
+            ouch 'App_Pipeline_Lite4_ERROR',"A groupby placeholder exists in the step $step_name when it is not a .groupby step.";
+        }
+        if( defined( $placeholder_resolved_str ) ){
+             $self->_placeholder_hash_add_item( $placeholder, $placeholder_resolved_str); #in order key,value
+             $self->logger->debug("step $step_name. Generated file location for placeholder $placeholder as $placeholder_resolved_str");
+        }
+    }
+}
+
+# we can have steps of 
+#  * step.path
+#  * groupby.field.step.path 
+#  * jobs.step.path 
+sub _parse_steppath_placeholder {
+    my $self = shift;
+    my $placeholder = shift;
+    my $placeholder_rgx = qr/^([\w\-]+)(\.(.+))*$/; 
+    my @steppath;
+    if( @steppath= $placeholder =~ $placeholder_rgx ){
+        return @steppath;
+    }
+}
+
+sub _parse_jobs_placeholder {
+    my $self = shift;
+    my $placeholder = shift;
+    my $jobs_placeholder_rgx = qr/jobs\.([\w\-]+)\.(.+)$/; 
+    my @steppath;
+    if( @steppath= $placeholder =~ $jobs_placeholder_rgx ){
+        return @steppath;
+    }
+}
+
+sub _placeholder_step_form {
+    my $self = shift;
+    my $placeholder = shift;
+    #my $step_name   = shift;
+   
+    my $jobs_placeholder_rgx = qr/jobs\.([\w\-]+)\.(.+)$/;
+    if($placeholder =~ $jobs_placeholder_rgx){
+        return "jobs";    
+    }
+    
+    if( $placeholder =~ /groupby/ ){  
+        return "groupby";
+    }
+    
+    # if it's not a jobs or groupby placeholder it's of the form step.path    
+    my $placeholder_rgx = qr/^([\w\-]+)(\.(.+))*$/;
+    
+    if( $placeholder =~ $placeholder_rgx ){
+        return "step.path";
+    }
+}
+
+ #==== case 1. stepX.fileY ====
+#resolves placeholders of the form of step.path
+sub _resolve_steppath_step_placeholder {
+    my $self = shift;
+    my $placeholder = shift;
+    my $step_name   = shift;
+    my $JOB_NUM     = shift;
+    my $placeholder_resolved_str;
+    my @output_run_dir;
+            
+   
+    $self->logger->debug("step $step_name. Processing $placeholder");
+    my $placeholder_rgx = qr/^($step_name)(\.(.+))*$/;
+    @output_run_dir = $placeholder =~ $placeholder_rgx ;
+    $self->logger->debug("step $step_name. Got " . Dumper(@output_run_dir) . " from $placeholder");
+    # we don't want [1] - the dot, so @output_run_dir is 2 length array
+    @output_run_dir = @output_run_dir[0,2];
+    if( defined $output_run_dir[1] ){ 
+          $placeholder_resolved_str = $self->_generate_file_output_location($JOB_NUM, \@output_run_dir)->stringify;                  
+    }elsif (  defined $output_run_dir[0]  ) {
+           #case where only the step name exists
+           pop @output_run_dir; # remove last entry because if second element is not defined array = ("stepname",undef) 
+           $placeholder_resolved_str = $self->_generate_file_output_location($JOB_NUM, \@output_run_dir)->stringify;
+           #warn "PLACEHOLDER", $placeholder;
+           #warn "OUTPUT RUN DIR (NORMAL PLCHOLDER) ". Dumper @output_run_dir;
+           #warn "OUTPUTFILES(NORMAL PLCHOLDER) ".$output_files;
+    }
+    $self->logger->debug("step $step_name. Extracted a run dir from: @output_run_dir. Full path is $placeholder_resolved_str ");
+    return $placeholder_resolved_str;
+}
+
+#==== case 2. jobs.[stepX|datasource].[fileY|datasource_column] ====
+# To resolve this form of placeholder we need to generate a list of resolved placeholder paths over ALL jobs 
+sub _resolve_jobs_step_placeholder {
+    my $self = shift;
+    my $placeholder = shift;
+    my $step_name   = shift;
+    my $JOB_NUM     = shift;
+    my $placeholder_resolved_str;
+    my @output_run_dir;
+    my $jobs_placeholder_rgx = qr/jobs\.([\w\-]+)\.(.+)$/;
+    @output_run_dir=$placeholder =~ $jobs_placeholder_rgx;
+    my @placeholder_resolved_paths; # all the placeholder resolved paths
+    my $num_of_jobs = $self->tot_jobs;
+    for my $job_num ( 0 .. $num_of_jobs -1 ) {
+         if( $output_run_dir[0] eq 'datasource' ) {
+             my $t = $self->pipeline_datasource;
+             my @datasource_rows = $t->col( $output_run_dir[1] );
+             push(  @placeholder_resolved_paths,$datasource_rows[$job_num] );
+         }else{
+             push(  @placeholder_resolved_paths,
+                    $self->_generate_file_output_location(
+                            $job_num, \@output_run_dir)->stringify );
+        }
+    }
+    # JOB FILTER: If we are running with specific job numbers, then we want only those paths associated
+    #             with those job numbers.
+    my $job_filter = $self->job_filter;
+    @placeholder_resolved_paths =  @placeholder_resolved_paths[@$job_filter] if defined ( $job_filter );
+    $placeholder_resolved_str = join ' ',  @placeholder_resolved_paths;
+    $self->logger->debug("step $step_name. Extracted a run dir from: @output_run_dir. Full path is $placeholder_resolved_str");
+    return $placeholder_resolved_str;
+}
+
+sub _resolve_groupby_step_placeholder {
+    my $self = shift;
+    my $placeholder = shift;
+    my $step_name   = shift;
+    my $JOB_NUM     = shift;
+    my $placeholder_resolved_str;
+    #my @output_run_dir;
+    if( $placeholder =~ /groupby/ ){  
+        my $groupby_placeholder_rgx;
+        # get the datasource
+        my $col_names = $self->pipeline_datasource->{header};
+        #warn "WORKING WITH DATASOURCE: " . $self->datasource_file; #warn "DATASOURCE: " . Dumper $self->pipeline_datasource;
+        my $col_names_rgx_str = join "|", @$col_names;
+        my $groupby_placeholder_rgx_str = 'groupby\.('.$col_names_rgx_str . ')\.(' . $col_names_rgx_str . ')*\.*([\w\-]+)\.(.+)$';
+        #warn "PLACEHOLDER $placeholder"; #warn "PLACEHOLDER RGX:", $groupby_placeholder_rgx_str;
+        $groupby_placeholder_rgx = qr/$groupby_placeholder_rgx_str/;
+        my @output_run_dir = $placeholder =~  $groupby_placeholder_rgx;
+        #warn "PLACEHOLDER PARTS:", Dumper @output_run_dir;
+        # Allows two groupby fields, here we check if the second groupby field is present
+        my @group_names;
+        if ( defined $output_run_dir[1] ){
+            @group_names = @output_run_dir[0,1];
+            @output_run_dir = @output_run_dir[2 .. $#output_run_dir];
+        }else{
+            @group_names = $output_run_dir[0 ];
+            @output_run_dir = @output_run_dir[2 .. $#output_run_dir];
+        }
+        # warn "OUTPUTDIR @output_run_dir";
+        if ( ! defined $output_run_dir[0] ){
+            ouch 'App_Pipeline_Lite4_ERROR', "The groupby placeholder has a group name that does not exist in the datasource";
+        }
+
+        #warn "OUTPUTDIR", "@output_run_dir";#warn "GROUP NAMES: @group_names";
+        my $util = App::Pipeline::Lite4::Util->new;            
+        my $job_map_hash = $util->datasource_groupby2( $self->pipeline_datasource, @group_names );
+        # This gives a hash e.g.: {groupA=> [0,1,2,3], groupB=>[4,5,6]}
+        #warn Dumper $job_map_hash;
+                            
+        my $job_filter = $self->job_filter;
+        my %job_filter_hash = map{ $_ => 1 } @$job_filter if defined($job_filter);
+               
+        # order the groupnames - so that we always have the same groups in the same jobs
+        my @grouped_jobs = sort keys %$job_map_hash;
+        my $grouped_job_idx;               
+        $grouped_job_idx = ($JOB_NUM <= $#grouped_jobs) ? $JOB_NUM : 0;
+               
+        # if there is a job filter then we have to get the right group index 
+        if( defined $job_filter){
+            $grouped_job_idx = $self->get_grouping_indexes($job_filter,$job_map_hash,$JOB_NUM); 
+        }
+             
+        # resolve for this placeholder the set of paths corresponding to the particular group associated with this JOB_NUM                             
+        my $grouped_jobs_id = $grouped_jobs[ $grouped_job_idx ];
+        my @placeholder_resolved_paths;
+        my $jobs = $job_map_hash->{$grouped_jobs_id};
+               
+        for my $job_num ( @$jobs){
+            if( defined($job_filter) ){ 
+                #skip adding into @placeholder_resolved_paths if job is in job filter
+                next unless exists($job_filter_hash{$job_num} );
+            }
+            if( $output_run_dir[0] eq 'datasource' ) {
+                my $t = $self->pipeline_datasource;
+                my @datasource_rows = $t->col( $output_run_dir[1] );
+                push( @placeholder_resolved_paths,$datasource_rows[$job_num] );
+            }else{
+                push( @placeholder_resolved_paths, $self->_generate_file_output_location($job_num, \@output_run_dir)->stringify );
+           }  
+        }
+        $placeholder_resolved_str = join ' ', @placeholder_resolved_paths;
+        #warn "STEPFILES: $output_files";
+        return $placeholder_resolved_str;
+    }
+}
+
+
 
 =method _create_directory_structure_from_placeholder_hash
   At the moment we  allow directory with 'dir' in the name
