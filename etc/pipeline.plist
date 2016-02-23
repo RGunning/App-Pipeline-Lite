@@ -800,6 +800,7 @@
 		<string>mem</string>
 		<string>cores</string>
 		<string>output</string>
+		<string>queue</string>
 	</array>
 	<key>Language Features</key>
 	<dict>
